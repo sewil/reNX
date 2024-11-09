@@ -27,18 +27,22 @@
 // the terms and conditions of the license of that module. An independent
 // module is a module which is not derived from or based on reNX.
 
+using Assembine;
+using reNX.NXProperties;
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
-using Assembine;
-using reNX.NXProperties;
 
-namespace reNX {
+namespace reNX
+{
     /// <summary>
     ///     An NX file.
     /// </summary>
-    public sealed unsafe class NXFile : IDisposable {
+    public sealed unsafe class NXFile : IDisposable
+    {
         internal readonly NXReadSelection _flags;
         internal readonly object _lock = new object();
 
@@ -51,13 +55,16 @@ namespace reNX {
         private BytePointerObject _pointerWrapper;
         private ulong* _stringBlock;
         private string[] _strings;
+        public string FilePath { get; private set; }
 
         /// <summary>
         ///     Creates and loads a NX file from a path.
         /// </summary>
         /// <param name="path"> The path where the NX file is located. </param>
         /// <param name="flag"> NX parsing flags. </param>
-        public NXFile(string path, NXReadSelection flag = NXReadSelection.None) {
+        public NXFile(string path, NXReadSelection flag = NXReadSelection.None)
+        {
+            FilePath = path;
             _flags = flag;
             _start = (_pointerWrapper = new MemoryMappedFile(path)).Pointer;
             Parse();
@@ -68,17 +75,148 @@ namespace reNX {
         /// </summary>
         /// <param name="input"> The byte array containing the NX file. </param>
         /// <param name="flag"> NX parsing flags. </param>
-        public NXFile(byte[] input, NXReadSelection flag = NXReadSelection.None) {
+        public NXFile(byte[] input, NXReadSelection flag = NXReadSelection.None)
+        {
+            FilePath = "-- from memory --";
             _flags = flag;
             _start = (_pointerWrapper = new ByteArrayPointer(input)).Pointer;
             Parse();
         }
 
+        private bool Import(NXNode parentOwnNode, NXNode ownNode, NXNode otherNode, string path, bool insideImg)
+        {
+            if (insideImg)
+            {
+                // Either node does not exist
+                if (ownNode == null || otherNode == null)
+                {
+
+                    Console.WriteLine("[" + path + "] " + "Missing node");
+                    return true;
+                }
+                // Child count does not match
+                if (ownNode.ChildCount != otherNode.ChildCount)
+                {
+
+                    Console.WriteLine("[" + path + "] " + "Child count mismatch {0} != {1}", ownNode.ChildCount, otherNode.ChildCount);
+                    return true;
+                }
+
+                // No children? Maybe the type/value changed
+                if (ownNode.ChildCount == 0 && otherNode.ChildCount == 0)
+                {
+                    var isSame = ownNode.IsSameAs(otherNode);
+                    if (!isSame)
+                    {
+                        Console.WriteLine("[" + path + "] " + "Found different node {0}: {1} != {2}", ownNode.Name, ownNode.ValueString(), otherNode.ValueString());
+                    }
+                    return !isSame;
+                }
+
+                // Iterate next nodes
+                var ownNodeNames = new List<string>(ownNode.Select(x => x.Name));
+                var otherNodeNames = new List<string>(otherNode.Select(x => x.Name));
+                var nodeNames = ownNodeNames.Union(otherNodeNames).Distinct();
+
+                const bool show_all_edits = false;
+                bool edits = false;
+                foreach (var nodeName in nodeNames)
+                {
+                    var own = ownNodeNames.Contains(nodeName) ? ownNode[nodeName] : null;
+                    var other = otherNodeNames.Contains(nodeName) ? otherNode[nodeName] : null;
+
+                    if (Import(ownNode, own, other, path + "/" + nodeName, true))
+                    {
+                        edits = true;
+                        // Coalesce down
+                        if (!show_all_edits) return true;
+                    }
+                }
+
+                return edits;
+            }
+
+            if (otherNode == null)
+            {
+                return true;
+            }
+
+            if (ownNode == null)
+            {
+                // New node. Add.
+                parentOwnNode[otherNode.Name] = otherNode;
+                parentOwnNode.IsExternallyLoaded = true;
+                Console.WriteLine($"Adding {path}");
+                return false;
+            }
+
+            var isImg = otherNode.Name.EndsWith(".img");
+
+            if (otherNode.ChildCount > 0)
+            {
+                // End of the node
+
+                var ownNodeNames = new List<string>(ownNode.Select(x => x.Name));
+                var otherNodeNames = new List<string>(otherNode.Select(x => x.Name));
+                var nodeNames = ownNodeNames.Union(otherNodeNames).Distinct();
+                bool edits = false;
+                foreach (var nodeName in nodeNames)
+                {
+                    var own = ownNodeNames.Contains(nodeName) ? ownNode[nodeName] : null;
+                    var other = otherNodeNames.Contains(nodeName) ? otherNode[nodeName] : null;
+                    var curNodePath = path + "/" + nodeName;
+                    if (Import(ownNode, own, other, curNodePath, isImg) && isImg)
+                    {
+                        edits = true;
+                        break;
+                    }
+                }
+
+                if (edits)
+                {
+                    parentOwnNode[otherNode.Name] = otherNode;
+                    parentOwnNode.IsExternallyLoaded = true;
+                    Console.WriteLine($"Replacing {path}");
+                }
+                ownNode.Unload(true);
+                otherNode.Unload(true);
+            }
+            // Don't care about regular nodes
+            return false;
+        }
+
+        public void Import(NXFile otherFile)
+        {
+            var ownNode = BaseNode;
+            var otherNode = otherFile.BaseNode;
+            var nodeNames = ownNode.Union(otherNode).Select(x => x.Name).Distinct();
+
+            foreach (var nodeName in nodeNames)
+            {
+                var own = ownNode.ContainsChild(nodeName) ? ownNode[nodeName] : null;
+                var other = otherNode.ContainsChild(nodeName) ? otherNode[nodeName] : null;
+                Import(BaseNode, own, other, nodeName, false);
+                own?.Unload(true);
+                other?.Unload(true);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+        }
+
+        private object _lockObject = 1;
         /// <summary>
         ///     The base node of this NX file.
         /// </summary>
-        public NXNode BaseNode {
-            get { return _nodes[0] ?? (_nodes[0] = NXNode.ParseNode(_nodeBlock, null, this)); }
+        public NXNode BaseNode
+        {
+            get
+            {
+                lock (_lockObject)
+                {
+                    if (_nodes[0] == null) _nodes[0] = NXNode.ParseNode(_nodeBlock, null, this);
+                }
+                return _nodes[0];
+            }
         }
 
         #region IDisposable Members
@@ -86,8 +224,16 @@ namespace reNX {
         /// <summary>
         ///     Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
         /// </summary>
-        public void Dispose() {
+        public void Dispose()
+        {
             if (_pointerWrapper != null) _pointerWrapper.Dispose();
+            if (_nodes != null)
+            {
+                foreach (var node in _nodes)
+                {
+                    node?.Unload(true);
+                }
+            }
             _pointerWrapper = null;
             _nodes = null;
             _strings = null;
@@ -99,7 +245,8 @@ namespace reNX {
         /// <summary>
         ///     Destructor.
         /// </summary>
-        ~NXFile() {
+        ~NXFile()
+        {
             Dispose();
         }
 
@@ -108,7 +255,8 @@ namespace reNX {
         /// </summary>
         /// <param name="path"> The path to resolve. </param>
         /// <exception cref="System.Collections.Generic.KeyNotFoundException">The path is invalid.</exception>
-        public NXNode ResolvePath(string path) {
+        public NXNode ResolvePath(string path)
+        {
             return
                 (path.StartsWith("/") ? path.Substring(1) : path).Split('/')
                                                                  .Where(node => node != ".")
@@ -117,7 +265,18 @@ namespace reNX {
                                                                             current[node]);
         }
 
-        private void Parse() {
+        public bool ContainsPath(string path)
+        {
+            try
+            {
+                var node = ResolvePath(path);
+                return node != null;
+            }
+            catch (NullReferenceException) { return false; }
+        }
+
+        private void Parse()
+        {
             HeaderData hd = *((HeaderData*)_start);
             if (hd.PKG3 != 0x34474B50) Util.Die("NX file has invalid header; invalid magic");
             _nodeBlock = (NXNode.NodeData*)(_start + hd.NodeBlock);
@@ -129,7 +288,8 @@ namespace reNX {
             if (hd.SoundCount > 0) _mp3Block = (ulong*)(_start + hd.SoundBlock);
         }
 
-        internal string GetString(uint id) {
+        internal string GetString(uint id)
+        {
             if (_strings[id] != null) return _strings[id];
             byte* ptr = _start + _stringBlock[id];
             var raw = new byte[*((ushort*)ptr)];
@@ -140,7 +300,8 @@ namespace reNX {
         #region Nested type: HeaderData
 
         [StructLayout(LayoutKind.Explicit, Pack = 4, Size = 52)]
-        private struct HeaderData {
+        private struct HeaderData
+        {
             [FieldOffset(0)] public readonly uint PKG3;
 
             [FieldOffset(4)] public readonly uint NodeCount;
@@ -167,7 +328,8 @@ namespace reNX {
     ///     NX reading flags.
     /// </summary>
     [Flags]
-    public enum NXReadSelection : byte {
+    public enum NXReadSelection : byte
+    {
         /// <summary>
         ///     No flags are enabled, that is, lazy loading of string, audio and bitmap properties is enabled. This is default.
         /// </summary>
@@ -204,14 +366,17 @@ namespace reNX {
         EagerParseAllProperties = EagerParseBitmap | EagerParseAudio | EagerParseStrings,
     }
 
-    internal static class Util {
+    internal static class Util
+    {
         internal static readonly bool _is64Bit = IntPtr.Size == 8;
 
-        internal static T Die<T>(string cause) {
+        internal static T Die<T>(string cause)
+        {
             throw new NXException(cause);
         }
 
-        internal static void Die(string cause) {
+        internal static void Die(string cause)
+        {
             throw new NXException(cause);
         }
 
